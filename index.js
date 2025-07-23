@@ -186,5 +186,5 @@ app.listen(PORT, () => {
 })
 
 setInterval(() => {
-  axios.get('https://narkbot.onrender.com/').then(() => console.log('📡 Ping OK')).catch(() => console.log('⚠️ Ping NEPAVYKO'))
+  axios.get('https://qwqcbot.onrender.com/').then(() => console.log('📡 Ping OK')).catch(() => console.log('⚠️ Ping NEPAVYKO'))
 }, 5 * 60 * 1000)
