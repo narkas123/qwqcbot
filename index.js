@@ -33,7 +33,7 @@ function createBot(username, password) {
     port: 25565,
     username: username,
     auth: 'offline',
-    version: '26.1.2',
+    version: '21.19.4',
   })
 
   bot.on('login', () => {
