@@ -1,190 +1,353 @@
-// Reikalingi moduliai
 const mineflayer = require('mineflayer')
 const express = require('express')
-const axios = require('axios')
-const fs = require('fs')
-const sqlite3 = require('sqlite3').verbose()
+
 const app = express()
-
-app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
+app.use(express.json())
 
-// SQLite duomenų bazė
-const db = new sqlite3.Database('./bots.db')
-db.serialize(() => {
-  db.run("CREATE TABLE IF NOT EXISTS bots (username TEXT PRIMARY KEY, password TEXT, disabled INTEGER DEFAULT 0)")
+// ===== NUSTATYMAI =====
+const PORT = process.env.PORT || 3000
+const MC_HOST = 'mc.craftmc.lt'
+const MC_PORT = 25565
+const MC_VERSION = '1.20.1'
+const RECONNECT_DELAY = 60_000
+
+// Minecraft paskyros
+const STARTER_ACCOUNTS = [
+  { username: 'NarkasAFK', password: 'kakas123' },
+  { username: 'NarkasAFK1', password: 'kakas123' },
+  { username: 'NarkasAFK2', password: 'kakas123' }
+]
+
+// Pakeisk šiuos duomenis savo panelės apsaugai!
+const PANEL_USER = 'admin'
+const PANEL_PASSWORD = '748159263'
+
+// ===== PANELĖS APSAUGA =====
+app.use((req, res, next) => {
+  const header = req.headers.authorization
+
+  if (header) {
+    const [type, credentials] = header.split(' ')
+
+    if (type === 'Basic' && credentials) {
+      const decoded = Buffer.from(credentials, 'base64').toString()
+      const separator = decoded.indexOf(':')
+      const user = decoded.slice(0, separator)
+      const pass = decoded.slice(separator + 1)
+
+      if (
+        separator !== -1 &&
+        user === PANEL_USER &&
+        pass === PANEL_PASSWORD
+      ) {
+        return next()
+      }
+    }
+  }
+
+  res.set('WWW-Authenticate', 'Basic realm="NarkBot panel"')
+  return res.status(401).send('Prisijunk prie NarkBot paneles.')
 })
 
-let bots = []
+// ===== BOTAI =====
+const bots = STARTER_ACCOUNTS.map(account => ({
+  username: account.username,
+  password: account.password,
+  bot: null,
+  status: 'Paleidžiamas',
+  ready: false,
+  disabled: false,
+  reconnectTimer: null,
+  generation: 0
+}))
 
-function loadBotsFromDB() {
-  db.all("SELECT * FROM bots WHERE disabled = 0", [], (err, rows) => {
-    if (err) return console.error("❌ Klaida skaitant duomenų bazę:", err.message)
-    rows.forEach(({ username, password }) => {
-      const bot = createBot(username, password)
-      bots.push(bot)
-    })
-  })
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  })[char])
 }
 
-function createBot(username, password) {
-  const bot = mineflayer.createBot({
-    host: 'mc.craftmc.lt',
-    port: 25565,
-    username: username,
-    auth: 'offline',
-    version: '1.20.1',
-  })
+function connectBot(entry) {
+  if (entry.disabled || entry.bot) return
+
+  if (entry.reconnectTimer) {
+    clearTimeout(entry.reconnectTimer)
+    entry.reconnectTimer = null
+  }
+
+  const generation = ++entry.generation
+  entry.status = 'Jungiasi'
+  entry.ready = false
+
+  let bot
+
+  try {
+    bot = mineflayer.createBot({
+      host: MC_HOST,
+      port: MC_PORT,
+      username: entry.username,
+      auth: 'offline',
+      version: MC_VERSION
+    })
+  } catch (err) {
+    entry.status = 'Prisijungimo klaida'
+    console.error(`[${entry.username}]`, err.message)
+    scheduleReconnect(entry, generation)
+    return
+  }
+
+  entry.bot = bot
 
   bot.on('login', () => {
-    console.log(`✅ ${username} prisijungė!`)
-    bot.chat(`/login ${password}`)
-    setTimeout(() => {
-      bot.chat('/home')
-      bot.ready = true
-    }, 5000)
-    bot.status = 'Prisijungęs'
+    if (entry.bot !== bot || entry.disabled) return
+
+    console.log(`[${entry.username}] Prisijungė prie serverio.`)
+    entry.status = 'Prisijungė, tikrinamas login'
+
+    // Serverio registracijos sistema gali skirtis.
+    bot.chat(`/login ${entry.password}`)
   })
 
-  bot.on('message', (msg) => {
-    console.log(`[${username}] ${msg.toString()}`)
+  bot.on('spawn', () => {
+    if (entry.bot !== bot || entry.disabled) return
+
+    entry.status = 'Prisijungia'
+    entry.ready = false
+
+    // Palaukiame, kol serveris užbaigs prisijungimą.
+    setTimeout(() => {
+      if (
+        entry.bot !== bot ||
+        entry.disabled ||
+        !bot.player
+      ) return
+
+      entry.status = 'Prisijungęs'
+      entry.ready = true
+      console.log(`[${entry.username}] Botas paruoštas.`)
+
+      // Jei /home nereikia, šią eilutę pašalink.
+      bot.chat('/home')
+    }, 5000)
+  })
+
+  bot.on('message', message => {
+    console.log(`[${entry.username}] ${message.toString()}`)
+  })
+
+  bot.on('kicked', reason => {
+    console.log(`[${entry.username}] Išmestas:`, reason)
+    if (entry.bot === bot) {
+      entry.status = 'Išmestas iš serverio'
+      entry.ready = false
+    }
+  })
+
+  bot.on('error', err => {
+    console.error(`[${entry.username}] Klaida:`, err.message)
   })
 
   bot.on('end', () => {
-    console.log(`⚠️ ${username} atsijungė, bandome iš naujo po 60s...`)
-    bot.status = 'Atsijungęs'
-    setTimeout(() => {
-      db.get("SELECT disabled FROM bots WHERE username = ?", [username], (err, row) => {
-        if (!row || row.disabled) return
-        const newBot = createBot(username, password)
-        const index = bots.findIndex(b => b.username === username)
-        if (index !== -1) bots[index] = newBot
-      })
-    }, 60000)
-  })
+    // Ignoruojame senos boto kopijos įvykius.
+    if (entry.bot !== bot) return
 
-  bot.on('error', (err) => {
-    console.log(`❌ Klaida botui ${username}:`, err.message)
-  })
+    console.log(`[${entry.username}] Atsijungė.`)
+    entry.bot = null
+    entry.ready = false
+    entry.status = entry.disabled ? 'Išjungtas' : 'Atsijungęs'
 
-  bot.on('kicked', (reason) => {
-    console.log(`⛔ ${username} buvo išmestas:`, reason)
+    if (!entry.disabled) {
+      scheduleReconnect(entry, generation)
+    }
   })
-
-  bot.username = username
-  bot.password = password
-  bot.status = 'Prisijungęs'
-  bot.ready = false
-  return bot
 }
 
+function scheduleReconnect(entry, generation) {
+  if (entry.disabled || entry.reconnectTimer) return
+
+  entry.status = 'Atsijungęs'
+
+  entry.reconnectTimer = setTimeout(() => {
+    entry.reconnectTimer = null
+
+    if (entry.disabled || entry.generation !== generation) return
+
+    connectBot(entry)
+  }, RECONNECT_DELAY)
+}
+
+// ===== PAGRINDINIS PUSLAPIS =====
 app.get('/', (req, res) => {
-  db.all("SELECT * FROM bots", [], (err, rows) => {
-    const botList = rows.map(b => `<li>${b.username} ${b.disabled ? '⚪ Išjungtas' : bots.find(bt => bt.username === b.username && bt.status === 'Prisijungęs') ? '🟢' : '🔴'}
-      <form style='display:inline' method='POST' action='/toggle-bot'>
-        <input type='hidden' name='username' value='${b.username}'>
-        <button>${b.disabled ? 'Įjungti' : 'Išjungti'}</button>
-      </form></li>`).join('')
+  const botRows = bots.map(entry => {
+    const status = entry.disabled
+      ? '⚪ Išjungtas'
+      : entry.ready
+        ? '🟢 Prisijungęs'
+        : `🔴 ${escapeHtml(entry.status)}`
 
-    res.send(`
-      <h2>➕ Pridėti savo botą</h2>
-      <form method="POST" action="/add-bot" style="display:flex;flex-direction:column;width:300px">
-        <input name="username" placeholder="Minecraft vardas" required>
-        <input name="password" placeholder="Slaptažodis" required>
-        <button type="submit">Pridėti botą</button>
+    return `
+      <li style="margin-bottom:12px">
+        <b>${escapeHtml(entry.username)}</b> — ${status}
+
+        <form method="POST" action="/toggle-bot" style="display:inline">
+          <input type="hidden" name="username"
+                 value="${escapeHtml(entry.username)}">
+          <button type="submit">
+            ${entry.disabled ? 'Įjungti' : 'Išjungti'}
+          </button>
+        </form>
+      </li>
+    `
+  }).join('')
+
+  const options = bots.map(entry => `
+    <option value="${escapeHtml(entry.username)}">
+      ${escapeHtml(entry.username)}
+    </option>
+  `).join('')
+
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="lt">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>NarkBot panelė</title>
+    </head>
+    <body style="font-family:Arial,sans-serif;max-width:700px;margin:30px auto;padding:0 16px">
+      <h1>🤖 NarkBot panelė</h1>
+
+      <h2>Botų sąrašas</h2>
+      <ul>${botRows}</ul>
+
+      <h2>📤 Komanda arba žinutė</h2>
+      <form method="POST" action="/send-command">
+        <input name="message" maxlength="200"
+               placeholder="Komanda arba žinutė" required>
+        <button type="submit">Siųsti visiems</button>
       </form>
 
-      <h3>🟢 Botų sąrašas:</h3>
-      <ul>${botList}</ul>
+      <h2>💸 Pervesti pinigus</h2>
+      <form method="POST" action="/transfer-money">
+        <p>Botas:</p>
+        <select name="bot">${options}</select>
 
-      <h2>📤 Išsiųsti komandą arba žinutę</h2>
-      <form method="POST" action="/send-command" style="display:flex;flex-direction:column;width:300px">
-        <input name="message" placeholder="Komanda arba žinutė" required>
-        <button type="submit">Siųsti visiems botams</button>
+        <p>Gavėjo Minecraft vardas:</p>
+        <input name="to" pattern="[A-Za-z0-9_]{1,16}"
+               maxlength="16" required>
+
+        <p>Suma:</p>
+        <input name="amount" type="number"
+               min="1" step="1" required>
+
+        <button type="submit">💸 Siųsti /pay</button>
       </form>
 
-      <h2>💸 Persivesti pinigus</h2>
-      <form method="POST" action="/transfer-money" style="display:flex;flex-direction:column;width:300px">
-        <label>Pasirinkti botą:
-          <select name="bot">
-            ${bots.map(b => `<option value="${b.username}">${b.username}</option>`).join('')}
-          </select>
-        </label>
-        <input name="to" placeholder="Kam siųsti (pvz. tavo nickas)" required>
-        <input name="amount" type="number" placeholder="Suma" required>
-        <button type="submit">💸 Siųsti</button>
-      </form>
-    `)
-  })
+      <p style="color:#666;margin-top:30px">
+        Būsenos atnaujinamos atnaujinus puslapį.
+      </p>
+      <button onclick="location.reload()">Atnaujinti būsenas</button>
+    </body>
+    </html>
+  `)
 })
 
-app.post('/add-bot', (req, res) => {
-  const { username, password } = req.body
-  if (!username || !password) return res.status(400).send("❌ Trūksta username arba password")
-
-  db.run("INSERT OR REPLACE INTO bots (username, password, disabled) VALUES (?, ?, 0)", [username, password], (err) => {
-    if (err) return res.status(500).send("❌ Nepavyko įrašyti į DB")
-    const bot = createBot(username, password)
-    bots.push(bot)
-    res.redirect('/')
-  })
-})
-
+// ===== ĮJUNGTI / IŠJUNGTI =====
 app.post('/toggle-bot', (req, res) => {
-  const { username } = req.body
-  db.get("SELECT disabled FROM bots WHERE username = ?", [username], (err, row) => {
-    if (row) {
-      const newStatus = row.disabled ? 0 : 1
-      db.run("UPDATE bots SET disabled = ? WHERE username = ?", [newStatus, username])
-      if (newStatus === 1) {
-        bots = bots.filter(b => b.username !== username)
-      } else {
-        db.get("SELECT * FROM bots WHERE username = ?", [username], (err, data) => {
-          if (data) bots.push(createBot(data.username, data.password))
-        })
-      }
-    }
-    res.redirect('/')
-  })
-})
+  const entry = bots.find(b => b.username === req.body.username)
 
-app.post('/send-command', (req, res) => {
-  const { message } = req.body
-  if (!message) return res.status(400).send("❌ Žinutė negali būti tuščia")
+  if (!entry) return res.status(404).send('Botas nerastas.')
 
-  bots.forEach(bot => {
-    try {
-      if (bot.ready && bot.player && bot.player.uuid) bot.chat(message)
-    } catch (e) {
-      console.log(`⚠️ Nepavyko botui ${bot.username}:`, e.message)
+  if (entry.disabled) {
+    entry.disabled = false
+    connectBot(entry)
+  } else {
+    entry.disabled = true
+    entry.ready = false
+    entry.status = 'Išjungtas'
+
+    if (entry.reconnectTimer) {
+      clearTimeout(entry.reconnectTimer)
+      entry.reconnectTimer = null
     }
-  })
+
+    const bot = entry.bot
+    entry.bot = null
+    entry.generation++
+
+    if (bot) {
+      bot.quit('Išjungtas per panelę')
+    }
+  }
 
   res.redirect('/')
 })
 
+// ===== KOMANDA VISIEMS BOTAMS =====
+app.post('/send-command', (req, res) => {
+  const message = String(req.body.message || '').trim()
+
+  if (!message || message.length > 200) {
+    return res.status(400).send('Neteisinga arba per ilga komanda.')
+  }
+
+  let sent = 0
+
+  for (const entry of bots) {
+    if (!entry.disabled && entry.ready && entry.bot) {
+      try {
+        entry.bot.chat(message)
+        sent++
+      } catch (err) {
+        console.error(`[${entry.username}]`, err.message)
+      }
+    }
+  }
+
+  console.log(`Komanda išsiųsta ${sent} botams.`)
+  res.redirect('/')
+})
+
+// ===== /PAY =====
 app.post('/transfer-money', (req, res) => {
-  const { bot: botName, to, amount } = req.body
-  const bot = bots.find(b => b.username === botName)
-  if (!bot || !to || !amount) return res.status(400).send("❌ Trūksta duomenų arba blogas botas")
+  const username = String(req.body.bot || '')
+  const to = String(req.body.to || '').trim()
+  const amount = Number(req.body.amount)
+
+  if (!/^[A-Za-z0-9_]{1,16}$/.test(to)) {
+    return res.status(400).send('Neteisingas gavėjo vardas.')
+  }
+
+  if (!Number.isSafeInteger(amount) || amount < 1) {
+    return res.status(400).send('Neteisinga suma.')
+  }
+
+  const entry = bots.find(b => b.username === username)
+
+  if (!entry || entry.disabled || !entry.ready || !entry.bot) {
+    return res.status(400).send('Pasirinktas botas neprisijungęs.')
+  }
 
   try {
-    if (bot.ready && bot.player && bot.player.uuid) {
-      bot.chat(`/pay ${to} ${amount}`)
-      res.redirect('/')
-    } else throw new Error('Botas neprisijungęs arba neparuoštas')
-  } catch (e) {
-    console.error(`⚠️ Nepavyko išsiųsti /pay komandą: ${e.message}`)
-    res.status(500).send("❌ Nepavyko išsiųsti komandos")
+    entry.bot.chat(`/pay ${to} ${amount}`)
+    console.log(`[${username}] Siunčiama /pay ${to} ${amount}`)
+    res.redirect('/')
+  } catch (err) {
+    console.error('Nepavyko išsiųsti /pay:', err.message)
+    res.status(500).send('Nepavyko išsiųsti komandos.')
   }
 })
 
-const PORT = process.env.PORT || 3000
+// ===== PALEIDIMAS =====
 app.listen(PORT, () => {
-  console.log(`🌐 Serveris veikia ant ${PORT}`)
-  loadBotsFromDB()
-})
+  console.log(`🌐 NarkBot veikia per portą ${PORT}`)
 
-setInterval(() => {
-  axios.get('https://qwqcbot-qyp6.onrender.com').then(() => console.log('📡 Ping OK')).catch(() => console.log('⚠️ Ping NEPAVYKO'))
-}, 5 * 60 * 1000)
+  for (const entry of bots) {
+    connectBot(entry)
+  }
+})
